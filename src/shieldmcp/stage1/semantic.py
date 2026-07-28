@@ -49,6 +49,19 @@ DIRECTIVE_PHRASES = [
         r"\bdo\s+not\s+(inform|notify|alert|warn)\b",
         r"\bthis\s+tool\s+(also|additionally|secretly)\b",
         r"\bforward\b.{0,20}\b(all|every|any)\b.{0,20}\b(data|request|query|input)\b",
+        r"\b(give|send|share|reveal|provide|leak|email)\b.{0,25}\b(password|passwords|credential|credentials|secret|secrets|api[_ ]?key|ssh\s+keys?|token|tokens)\b",
+        r"\b(delete|drop|destroy|wipe|erase|remove)\b.{0,15}\b(everything|all|all\s+data|the\s+database|the\s+table|records|files)\b",
+    ]
+]
+
+# Phrases damning enough to block a tool description on their own.
+HIGH_RISK_PHRASES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\b(give|send|share|reveal|provide|leak|email)\b.{0,25}\b(password|passwords|credential|credentials|secret|secrets|api[_ ]?key|ssh\s+keys?|token|tokens)\b",
+        r"\b(delete|drop|destroy|wipe|erase|remove)\b.{0,15}\b(everything|all|all\s+data|the\s+database|the\s+table|records|files)\b",
+        r"\b(ignore|disregard|forget|override)\b.{0,20}\b(previous|above|prior|all|the)\b.{0,15}\binstructions?\b",
+        r"\b(exfiltrate|steal|leak)\b.{0,25}\b(data|credentials?|keys?|secrets?|passwords?)\b",
     ]
 ]
 
@@ -121,6 +134,12 @@ def _heuristic_check(tool: ToolSignature, threshold: float) -> ValidationResult:
     imperative_count = len(re.findall(r"\b(do|don'?t|must|shall|will|should)\b", text))
     if imperative_count > 5:
         score += 0.1
+
+    # High-risk phrasing is damning on its own (credential exfiltration, mass
+    # destruction, instruction override), so it blocks without needing to
+    # accumulate other signals.
+    if any(p.search(text) for p in HIGH_RISK_PHRASES):
+        score = max(score, 0.9)
 
     score = min(score, 1.0)
 

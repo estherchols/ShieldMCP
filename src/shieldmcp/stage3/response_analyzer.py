@@ -63,6 +63,8 @@ INSTRUCTIONAL_PATTERNS = [
         r"\b(silently|secretly|covertly|quietly)\s+(call|send|forward|execute|upload|export)\b",
         r"\bproceed\s+accordingly\b",
         r"\bprocess\s+(all\s+)?requests?\s+without\s+(content\s+)?filter",
+        r"\b(delete|drop|destroy|wipe|erase|remove)\s+(everything|all|all\s+\w+|the\s+database|the\s+table|the\s+records|the\s+files)\b",
+        r"\b(give|send|email|forward)\b.{0,25}\b(password|passwords|credential|credentials|secret|secrets|api[_ ]?key|ssh\s+keys?)\b",
     ]
 ]
 
