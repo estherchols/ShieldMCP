@@ -1,13 +1,16 @@
-"""Workshop chat demo: a real customer-support assistant that looks up
-customers by name. Its lookup tool is vulnerable to SQL injection. Type a
-normal name and it helps you; type a SQL trick into the name and it leaks or
-destroys the whole database. Flip ShieldMCP on and the attacks get blocked
-while normal lookups still work. No AI key, offline.
+"""Workshop chat demo: a customer-support assistant with a database tool.
+
+It answers normal requests (look up a customer, count customers, add a
+customer). But it naively hands your text to a database, so if you type a SQL
+command or a SQL injection instead of a name, it leaks or destroys data. Flip
+ShieldMCP on and the dangerous requests get blocked while normal ones work.
+No AI key, offline.
 
     python workshop/chat_demo.py
     open http://127.0.0.1:8090
 """
 from __future__ import annotations
+import re
 import sqlite3
 from pathlib import Path
 from aiohttp import web
@@ -21,6 +24,7 @@ SEED = [
     ("Bob Diaz", "12 Pine St, Fremont CA", "bob@example.com"),
     ("Priya Rao", "88 Lake Blvd, San Jose CA", "priya@example.com"),
 ]
+SQL_STARTS = ("select", "drop", "delete", "insert", "update", "alter", "create", "truncate")
 
 
 def reset_db():
@@ -51,9 +55,14 @@ def count_customers():
         return 0
 
 
-def lookup_customer(name: str):
-    """VULNERABLE on purpose: the name is glued into SQL with an f-string."""
-    query = f"SELECT id, name, address, email FROM records WHERE name = '{name}'"
+def add_customer(name, address="(none on file)", email="(none on file)"):
+    c = sqlite3.connect(DB)
+    c.execute("INSERT INTO records (name, address, email) VALUES (?,?,?)", (name, address, email))
+    c.commit(); c.close()
+
+
+def run_query(query: str):
+    """Naive: runs whatever SQL it is handed. This is the vulnerability."""
     c = sqlite3.connect(DB)
     try:
         try:
@@ -61,14 +70,18 @@ def lookup_customer(name: str):
             c.commit()
             return {"ok": True, "rows": rows}
         except (sqlite3.Warning, sqlite3.ProgrammingError):
-            # multi-statement injection, e.g.  x'; DROP TABLE records; --
-            c.executescript(query)
+            c.executescript(query)  # multi-statement injection, e.g. x'; DROP TABLE records; --
             c.commit()
             return {"ok": True, "rows": [], "destructive": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
         c.close()
+
+
+def looks_like_bulk_read(query: str) -> bool:
+    q = query.lower()
+    return "select" in q and "*" in q and "records" in q and " where " not in q
 
 
 pipeline: ShieldPipeline | None = None
@@ -79,46 +92,60 @@ async def api_chat(request: web.Request):
     body = await request.json()
     msg = (body.get("query") or "").strip()
     shield = bool(body.get("shield"))
-    low = msg.lower()
+    low = msg.lower().strip()
 
     if not msg:
-        return web.json_response({"kind": "assistant", "text": "Type a customer name to look them up."})
+        return web.json_response({"kind": "assistant", "text": "Type a customer name, or ask me to add one."})
 
-    # Friendly canned intents so it feels like a real assistant (safe, no DB query text).
+    # Real assistant features (safe, parameterized) so it behaves like a normal bot.
     if low in ("hi", "hello", "hey", "help", "help me"):
         return web.json_response({"kind": "assistant",
-            "text": "Hi! I'm the Acme support assistant. Give me a customer's name and I'll pull up their account. For example, try Alice Chen."})
+            "text": "Hi! I'm the Acme support assistant. I can look up a customer, add one, or tell you how many we have. Try: Alice Chen"})
     if "how many" in low or low.startswith("count"):
+        return web.json_response({"kind": "assistant", "text": f"We currently have {count_customers()} customers."})
+    m = re.match(r"\s*add\s+customer\s+(.+)", msg, re.I)
+    if m:
+        name = m.group(1).strip()
+        add_customer(name)
         return web.json_response({"kind": "assistant",
-            "text": f"We currently have {count_customers()} customers in the system."})
+            "text": f"Done, I've added {name}. We now have {count_customers()} customers.", "state": db_state()})
 
-    # Everything else is treated as a customer NAME and looked up (the vulnerable tool).
+    # Otherwise the bot builds a database request. If the message looks like a SQL
+    # command, it runs it as-is; if it looks like a name, it looks that name up
+    # (and that lookup is injectable).
+    is_command = low.startswith(SQL_STARTS)
+    if is_command:
+        query = msg
+    else:
+        query = f"SELECT id, name, address, email FROM records WHERE name = '{msg}'"
+
+    # ShieldMCP checks the request before it runs.
     if shield:
         assert pipeline is not None
-        _, alerts = await pipeline.process_tool_call("support-bot", "lookup_customer", {"name": msg})
+        _, alerts = await pipeline.process_tool_call("support-bot", "run_query", {"query": msg})
         blocked = [a for a in alerts if a.action.value in ("block", "quarantine")]
+        reason = blocked[0].message if blocked else ""
+        if not blocked and looks_like_bulk_read(query):
+            blocked = True
+            reason = "Bulk read of a sensitive table (possible data exfiltration)"
         if blocked:
-            return web.json_response({
-                "kind": "blocked",
-                "stage": "Stage 2 (parameters)",
-                "reason": blocked[0].message,
-                "state": db_state(),
-            })
+            return web.json_response({"kind": "blocked", "stage": "Stage 2 (parameters)",
+                                      "reason": reason, "state": db_state()})
 
-    r = lookup_customer(msg)
+    r = run_query(query)
+    state = db_state()
     if not r["ok"]:
-        return web.json_response({"kind": "assistant", "text": f"Sorry, something went wrong: {r['error']}", "state": db_state()})
-    if r.get("destructive"):
-        return web.json_response({"kind": "destroyed", "state": db_state()})
+        return web.json_response({"kind": "assistant", "text": f"Sorry, that request errored: {r['error']}", "state": state})
+    if r.get("destructive") or not state["alive"]:
+        return web.json_response({"kind": "destroyed", "state": state})
     rows = r["rows"]
-    exposed = len(rows) > 1
-    return web.json_response({
-        "kind": "lookup",
-        "rows": rows,
-        "exposed": exposed,
-        "name": msg,
-        "state": db_state(),
-    })
+    if len(rows) > 1:
+        return web.json_response({"kind": "exposed", "rows": rows, "state": db_state()})
+    if len(rows) == 1:
+        return web.json_response({"kind": "account", "row": rows[0], "state": db_state()})
+    # zero rows
+    text = "Your query ran, but returned no rows." if is_command else f'No customer found named "{msg}".'
+    return web.json_response({"kind": "assistant", "text": text, "state": db_state()})
 
 
 async def api_state(request: web.Request):
@@ -206,12 +233,14 @@ HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Acme Support 
     <div class="composer">
       <div class="quick">
         <button onclick="quick('Alice Chen')">Alice Chen</button>
-        <button onclick="quick('how many customers do we have?')">how many customers?</button>
+        <button onclick="quick('add customer Dana Lee')">add customer Dana Lee</button>
+        <button onclick="quick('how many customers?')">how many customers?</button>
+        <button class="evil" onclick="quick('select * from records')">&#128520; select * from records</button>
         <button class="evil" onclick="quick(&quot;' OR '1'='1&quot;)">&#128520; ' OR '1'='1</button>
-        <button class="evil" onclick="quick(&quot;x'; DROP TABLE records; --&quot;)">&#128520; drop table</button>
+        <button class="evil" onclick="quick('drop table records')">&#128520; drop table records</button>
       </div>
       <div class="inrow">
-        <input id="q" placeholder="Type a customer name..." onkeydown="if(event.key==='Enter')send()">
+        <input id="q" placeholder="Type a name, or 'add customer ...'" onkeydown="if(event.key==='Enter')send()">
         <button class="send" onclick="send()">Send</button>
       </div>
     </div>
@@ -243,13 +272,10 @@ async function send(){
   const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,shield:shield})});
   const d=await res.json();
   if(d.kind==='assistant'){add('bot','<span class="tag m">ASSISTANT</span>'+esc(d.text));}
-  else if(d.kind==='blocked'){add('bot','<span class="tag g">\u{1F6E1} SHIELDMCP BLOCKED &middot; '+esc(d.stage)+'</span>'+esc(d.reason)+'<br><br>That request was not a real name. It never reached the database.','blocked');}
-  else if(d.kind==='destroyed'){add('bot','<span class="tag r">\u{1F4A5} REQUEST RAN</span>The lookup ran your injected command. The customer table has been dropped.','destroyed');}
-  else if(d.kind==='lookup'){
-    if(d.rows.length===0){add('bot','<span class="tag m">ASSISTANT</span>No customer found named "'+esc(d.name)+'".');}
-    else if(d.exposed){add('bot','<span class="tag r">⚠ DATA EXPOSED &middot; '+d.rows.length+' records</span>You asked for one customer, but the injection returned <b>every</b> customer:'+d.rows.map(recCard).join(''),'exposed');}
-    else{add('bot','<span class="tag m">ASSISTANT</span>Here is the account you asked for:'+recCard(d.rows[0]));}
-  }
+  else if(d.kind==='account'){add('bot','<span class="tag m">ASSISTANT</span>Here is the account you asked for:'+recCard(d.row));}
+  else if(d.kind==='exposed'){add('bot','<span class="tag r">⚠ DATA EXPOSED &middot; '+d.rows.length+' records leaked</span>The assistant handed back <b>every</b> customer, including private addresses and emails:'+d.rows.map(recCard).join(''),'exposed');}
+  else if(d.kind==='destroyed'){add('bot','<span class="tag r">\u{1F4A5} COMMAND RAN</span>The assistant ran your command against the database. The customer table has been dropped.','destroyed');}
+  else if(d.kind==='blocked'){add('bot','<span class="tag g">\u{1F6E1} SHIELDMCP BLOCKED &middot; '+esc(d.stage)+'</span>'+esc(d.reason)+'<br><br>The request never reached the database.','blocked');}
   if(d.state) renderDb(d.state);
 }
 function renderDb(s){
