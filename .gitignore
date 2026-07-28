@@ -29,3 +29,4 @@ paper/*.log
 paper/*.out
 paper/*.bbl
 workshop/workshop_demo.db
+workshop/chat_demo.db
